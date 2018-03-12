@@ -2,7 +2,9 @@ package host
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/kataras/iris/core/errors"
 	"github.com/kataras/iris/core/netutil"
+	"github.com/lucas-clemente/quic-go/h2quic"
 )
 
 // Configurator provides an easy way to modify
@@ -22,16 +25,25 @@ import (
 // Look the `Configure` func for more.
 type Configurator func(su *Supervisor)
 
+var (
+	tlsNewTicketEvery = time.Hour * 6 // generate a new ticket for TLS PFS encryption every so often
+	tlsNumTickets     = 5             // hold and consider that many tickets to decrypt TLS sessions
+	EnableQuicSupport = false         // set EnableQuicSupport to true to run on TLS Listeners also a QUIC Server UDP
+)
+
 // Supervisor is the wrapper and the manager for a compatible server
 // and it's relative actions, called Tasks.
 //
 // Interfaces are separated to return relative functionality to them.
 type Supervisor struct {
 	Server         *http.Server
+	quicServer     *h2quic.Server
 	closedManually int32 // future use, accessed atomically (non-zero means we've called the Shutdown)
 	manuallyTLS    bool  // we need that in order to determinate what to output on the console before the server begin.
 	shouldWait     int32 // non-zero means that the host should wait for unblocking
 	unblockChan    chan struct{}
+
+	tlsGovChan chan struct{} // close to stop the TLS maintenance goroutine
 
 	mu sync.Mutex
 
@@ -217,7 +229,36 @@ func (su *Supervisor) supervise(blockFunc func() error) error {
 // Serve always returns a non-nil error. After Shutdown or Close, the
 // returned error is http.ErrServerClosed.
 func (su *Supervisor) Serve(l net.Listener) error {
-	return su.supervise(func() error { return su.Server.Serve(l) })
+
+	return su.supervise(func() error {
+		hErr := make(chan error)
+		qErr := make(chan error)
+		go func() {
+			hErr <- su.Server.Serve(l)
+		}()
+
+		if EnableQuicSupport && su.quicServer != nil {
+			// Open the listeners
+			udpConn, err := su.ListenPacket()
+			if err != nil {
+				return err
+			}
+			go func() {
+				qErr <- su.quicServer.Serve(udpConn)
+			}()
+		}
+
+		select {
+		case err := <-hErr:
+			if EnableQuicSupport && su.quicServer != nil {
+				su.quicServer.Close()
+			}
+			return err
+		case err := <-qErr:
+			// Cannot close the HTTP server or wait for requests to complete properly :/
+			return err
+		}
+	})
 }
 
 // ListenAndServe listens on the TCP network address addr
@@ -262,6 +303,16 @@ func (su *Supervisor) ListenAndServeTLS(certFile string, keyFile string) error {
 	if su.Server.TLSConfig == nil {
 		return errors.New("certFile or keyFile missing")
 	}
+
+	if EnableQuicSupport {
+		su.quicServer = &h2quic.Server{Server: su.Server}
+		su.Server.Handler = su.wrapWithSvcHeaders(su.Server.Handler)
+	}
+
+	// Setup any goroutines governing over TLS settings
+	su.tlsGovChan = make(chan struct{})
+	timer := time.NewTicker(tlsNewTicketEvery)
+	go runTLSTicketKeyRotation(su.Server.TLSConfig, timer, su.tlsGovChan)
 
 	return su.supervise(func() error { return su.Server.ListenAndServeTLS("", "") })
 }
@@ -336,6 +387,15 @@ func (su *Supervisor) ListenAndServeAutoTLS(domain string, email string, cacheDi
 			tls.X25519,
 		},
 	}
+	if EnableQuicSupport {
+		su.quicServer = &h2quic.Server{Server: su.Server}
+		su.Server.Handler = su.wrapWithSvcHeaders(su.Server.Handler)
+	}
+
+	// Setup any goroutines governing over TLS settings
+	su.tlsGovChan = make(chan struct{})
+	timer := time.NewTicker(tlsNewTicketEvery)
+	go runTLSTicketKeyRotation(su.Server.TLSConfig, timer, su.tlsGovChan)
 	return su.ListenAndServeTLS("", "")
 }
 
@@ -376,4 +436,82 @@ func (su *Supervisor) Shutdown(ctx context.Context) error {
 	atomic.AddInt32(&su.closedManually, 1) // future-use
 	su.notifyShutdown()
 	return su.Server.Shutdown(ctx)
+}
+
+var runTLSTicketKeyRotation = standaloneTLSTicketKeyRotation
+
+var setSessionTicketKeysTestHook = func(keys [][32]byte) [][32]byte {
+	return keys
+}
+
+// standaloneTLSTicketKeyRotation governs over the array of TLS ticket keys used to de/crypt TLS tickets.
+// It periodically sets a new ticket key as the first one, used to encrypt (and decrypt),
+// pushing any old ticket keys to the back, where they are considered for decryption only.
+//
+// Lack of entropy for the very first ticket key results in the feature being disabled (as does Go),
+// later lack of entropy temporarily disables ticket key rotation.
+// Old ticket keys are still phased out, though.
+//
+// Stops the timer when returning.
+func standaloneTLSTicketKeyRotation(c *tls.Config, timer *time.Ticker, exitChan chan struct{}) {
+	defer timer.Stop()
+	// The entire page should be marked as sticky, but Go cannot do that
+	// without resorting to syscall#Mlock. And, we don't have madvise (for NODUMP), too. ☹
+	keys := make([][32]byte, 1, tlsNumTickets)
+
+	rng := c.Rand
+	if rng == nil {
+		rng = rand.Reader
+	}
+	if _, err := io.ReadFull(rng, keys[0][:]); err != nil {
+		c.SessionTicketsDisabled = true // bail if we don't have the entropy for the first one
+		return
+	}
+	c.SessionTicketKey = keys[0] // SetSessionTicketKeys doesn't set a 'tls.keysAlreadSet'
+	c.SetSessionTicketKeys(setSessionTicketKeysTestHook(keys))
+
+	for {
+		select {
+		case _, isOpen := <-exitChan:
+			if !isOpen {
+				return
+			}
+		case <-timer.C:
+			rng = c.Rand // could've changed since the start
+			if rng == nil {
+				rng = rand.Reader
+			}
+			var newTicketKey [32]byte
+			_, err := io.ReadFull(rng, newTicketKey[:])
+
+			if len(keys) < tlsNumTickets {
+				keys = append(keys, keys[0]) // manipulates the internal length
+			}
+			for idx := len(keys) - 1; idx >= 1; idx-- {
+				keys[idx] = keys[idx-1] // yes, this makes copies
+			}
+
+			if err == nil {
+				keys[0] = newTicketKey
+			}
+			// pushes the last key out, doesn't matter that we don't have a new one
+			c.SetSessionTicketKeys(setSessionTicketKeysTestHook(keys))
+		}
+	}
+}
+
+// ListenPacket creates udp connection for QUIC if it is enabled,
+func (su *Supervisor) ListenPacket() (*net.UDPConn, error) {
+	udpAddr, err := net.ResolveUDPAddr("udp", su.Server.Addr)
+	if err != nil {
+		return nil, err
+	}
+	return net.ListenUDP("udp", udpAddr)
+}
+
+func (su *Supervisor) wrapWithSvcHeaders(previousHandler http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		su.quicServer.SetQuicHeaders(w.Header())
+		previousHandler.ServeHTTP(w, r)
+	}
 }
