@@ -304,7 +304,7 @@ func (su *Supervisor) ListenAndServeTLS(certFile string, keyFile string) error {
 		return errors.New("certFile or keyFile missing")
 	}
 
-	if EnableQuicSupport {
+	if EnableQuicSupport && su.quicServer == nil {
 		su.quicServer = &h2quic.Server{Server: su.Server}
 		su.Server.Handler = su.wrapWithSvcHeaders(su.Server.Handler)
 	}
@@ -387,15 +387,7 @@ func (su *Supervisor) ListenAndServeAutoTLS(domain string, email string, cacheDi
 			tls.X25519,
 		},
 	}
-	if EnableQuicSupport {
-		su.quicServer = &h2quic.Server{Server: su.Server}
-		su.Server.Handler = su.wrapWithSvcHeaders(su.Server.Handler)
-	}
 
-	// Setup any goroutines governing over TLS settings
-	su.tlsGovChan = make(chan struct{})
-	timer := time.NewTicker(tlsNewTicketEvery)
-	go runTLSTicketKeyRotation(su.Server.TLSConfig, timer, su.tlsGovChan)
 	return su.ListenAndServeTLS("", "")
 }
 
