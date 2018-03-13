@@ -314,7 +314,36 @@ func (su *Supervisor) ListenAndServeTLS(certFile string, keyFile string) error {
 	timer := time.NewTicker(tlsNewTicketEvery)
 	go runTLSTicketKeyRotation(su.Server.TLSConfig, timer, su.tlsGovChan)
 
-	return su.supervise(func() error { return su.Server.ListenAndServeTLS("", "") })
+	return su.supervise(func() error {
+		hErr := make(chan error)
+		qErr := make(chan error)
+		go func() {
+			hErr <- su.Server.ListenAndServeTLS("", "")
+		}()
+
+		if EnableQuicSupport && su.quicServer != nil {
+			// Open the listeners
+			udpConn, err := su.ListenPacket()
+			if err != nil {
+				return err
+			}
+			go func() {
+				qErr <- su.quicServer.Serve(udpConn)
+			}()
+		}
+
+		select {
+		case err := <-hErr:
+			if EnableQuicSupport && su.quicServer != nil {
+				su.quicServer.Close()
+			}
+			return err
+		case err := <-qErr:
+			// Cannot close the HTTP server or wait for requests to complete properly :/
+			return err
+		}
+	})
+	//return su.supervise(func() error { return su.Server.ListenAndServeTLS("", "") })
 }
 
 // ListenAndServeAutoTLS acts identically to ListenAndServe, except that it
