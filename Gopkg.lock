@@ -484,7 +484,7 @@
     "curve25519",
     "hkdf"
   ]
-  revision = "c7dcf104e3a7a1417abc0230cb0d5240d764159d"
+  revision = "182114d582623c1caa54f73de9c7224e23a48487"
 
 [[projects]]
   branch = "master"
@@ -501,13 +501,13 @@
     "publicsuffix",
     "trace"
   ]
-  revision = "ae89d30ce0c63142b652837da33d782e2b0a9b25"
+  revision = "803fdb99c0f72e493c28ef2099d250a9c989d8ff"
 
 [[projects]]
   branch = "master"
   name = "golang.org/x/sys"
   packages = ["unix"]
-  revision = "c28acc882ebcbfbe8ce9f0f14b9ac26ee138dd51"
+  revision = "8c0ece68c28377f4c326d85b94f8df0dace46f80"
 
 [[projects]]
   name = "golang.org/x/text"
@@ -551,6 +551,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "ad48702f211a756074c1e1088743d57c2b6b3a364c08a92fb39d224c9eec2e16"
+  inputs-digest = "3e2724179055f76bb05eae3958a5bdad5f6e8c97af63bf7d17f1de73bd2ecd50"
   solver-name = "gps-cdcl"
   solver-version = 1
